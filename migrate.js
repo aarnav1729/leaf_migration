@@ -13,37 +13,45 @@ const Verification = require('./models/Verification');
 
 // MSSQL Configuration
 const config = {
-  user: process.env.MSSQL_USER,
-  password: process.env.MSSQL_PASSWORD,
-  server: process.env.MSSQL_SERVER, // e.g., 'localhost'
-  database: process.env.MSSQL_DATABASE,
+  user: process.env.MSSQL_USER.trim(),
+  password: process.env.MSSQL_PASSWORD.trim(),
+  server: process.env.MSSQL_SERVER.trim(), 
+  port: parseInt(process.env.MSSQL_PORT.trim(), 10),
+  database: process.env.MSSQL_DATABASE.trim(),
   options: {
-    encrypt: true, // Use this if you're on Windows Azure
-    trustServerCertificate: true, // Change to true for local dev / self-signed certs
+    trustServerCertificate: true, // Use true for self-signed certificates
+    encrypt: false, // Set to true if you're connecting to Azure or require encryption
   },
 };
 
-// Connect to MongoDB
-mongoose.connect(process.env.MONGODB_URI, {
-  useNewUrlParser: true,
-  useUnifiedTopology: true,
-})
-.then(() => console.log("MongoDB connected"))
-.catch((err) => {
-  console.error("MongoDB connection error:", err);
-  process.exit(1);
-});
+// Remove deprecated options and connect to MongoDB
+const mongoConnectPromise = mongoose.connect(process.env.MONGODB_URI)
+  .then(() => console.log("MongoDB connected"))
+  .catch((err) => {
+    console.error("MongoDB connection error:", err);
+    process.exit(1);
+  });
 
 // Connect to MSSQL
-sql.connect(config)
-.then(() => {
-  console.log("MSSQL connected");
-  performMigration();
-})
-.catch((err) => {
-  console.error("MSSQL connection error:", err);
-  process.exit(1);
-});
+const mssqlConnectPromise = sql.connect(config)
+  .then(() => {
+    console.log("MSSQL connected");
+  })
+  .catch((err) => {
+    console.error("MSSQL connection error:", err);
+    process.exit(1);
+  });
+
+// Wait for both connections before starting the migration
+Promise.all([mongoConnectPromise, mssqlConnectPromise])
+  .then(() => {
+    console.log("Both MongoDB and MSSQL connections established.");
+    performMigration();
+  })
+  .catch((err) => {
+    console.error("Error establishing connections:", err);
+    process.exit(1);
+  });
 
 // Function to perform migration
 async function performMigration() {
@@ -299,64 +307,92 @@ async function getMssqlVendorId(mongoId) {
   return null;
 }
 
-// Function to migrate Quotes
 async function migrateQuotes() {
   console.log("Migrating Quotes...");
   const quotes = await Quote.find();
+  console.log(`Found ${quotes.length} quotes to migrate.`);
+  
+  let migratedCount = 0;
+  let skippedCount = 0;
 
   for (const quote of quotes) {
-    // Check if Quote already exists in MSSQL using MongoId
-    const existing = await sql.query`SELECT * FROM Quote WHERE MongoId = ${quote._id.toString()}`;
-    if (existing.recordset.length > 0) {
-      console.log(`Quote ID ${quote._id} already exists. Skipping.`);
-      continue;
-    }
+    try {
+      // Check if Quote already exists in MSSQL using MongoId
+      const existing = await sql.query`SELECT * FROM Quote WHERE MongoId = ${quote._id.toString()}`;
+      if (existing.recordset.length > 0) {
+        console.log(`Quote ID ${quote._id} already exists. Skipping.`);
+        skippedCount++;
+        continue;
+      }
 
-    // Get MSSQL RFQId based on RFQ MongoId
-    const mssqlRFQId = await getMssqlRFQId(quote.rfqId.toString());
-    if (!mssqlRFQId) {
-      console.warn(`RFQ with MongoId ${quote.rfqId} not found in MSSQL. Skipping Quote ID ${quote._id}.`);
-      continue;
-    }
+      // Get MSSQL RFQId based on RFQ MongoId
+      const mssqlRFQId = await getMssqlRFQId(quote.rfqId.toString());
+      if (!mssqlRFQId) {
+        console.warn(`RFQ with MongoId ${quote.rfqId} not found in MSSQL. Skipping Quote ID ${quote._id}.`);
+        skippedCount++;
+        continue;
+      }
 
-    // Get MSSQL VendorId based on vendorName
-    const mssqlVendorId = await getMssqlVendorIdByName(quote.vendorName);
-    if (!mssqlVendorId) {
-      console.warn(`Vendor with name ${quote.vendorName} not found in MSSQL. Skipping Quote ID ${quote._id}.`);
-      continue;
-    }
+      // Get MSSQL VendorId based on vendorName
+      const mssqlVendorId = await getMssqlVendorIdByName(quote.vendorName);
+      if (!mssqlVendorId) {
+        console.warn(`Vendor with name ${quote.vendorName} not found in MSSQL. Skipping Quote ID ${quote._id}.`);
+        skippedCount++;
+        continue;
+      }
 
-    await sql.query`
-      INSERT INTO Quote (
-        RFQId,
-        VendorName,
-        Price,
-        Message,
-        NumberOfTrucks,
-        ValidityPeriod,
-        Label,
-        TrucksAllotted,
-        NumberOfVehiclesPerDay,
-        CreatedAt,
-        UpdatedAt,
-        MongoId
-      ) VALUES (
-        ${mssqlRFQId},
-        ${quote.vendorName},
-        ${quote.price},
-        ${quote.message || null},
-        ${quote.numberOfTrucks},
-        ${quote.validityPeriod || null},
-        ${quote.label || null},
-        ${quote.trucksAllotted || 0},
-        ${quote.numberOfVehiclesPerDay},
-        ${quote.createdAt},
-        ${quote.updatedAt},
-        ${quote._id.toString()}
-      )
-    `;
-    console.log(`Inserted Quote ID: ${quote._id}`);
+      // Truncate Message to first line or to fit the column size
+      let truncatedMessage = null;
+      if (quote.message) {
+        // Extract the first line
+        truncatedMessage = quote.message.split('\n')[0];
+        
+        // Define the maximum allowed length (replace 255 with your actual limit if different)
+        const maxLength = 255;
+        if (truncatedMessage.length > maxLength) {
+          truncatedMessage = truncatedMessage.substring(0, maxLength);
+          console.warn(`Truncated Message for Quote ID ${quote._id} to fit the column size.`);
+        }
+      }
+
+      await sql.query`
+        INSERT INTO Quote (
+          RFQId,
+          VendorName,
+          Price,
+          Message,
+          NumberOfTrucks,
+          ValidityPeriod,
+          Label,
+          TrucksAllotted,
+          NumberOfVehiclesPerDay,
+          CreatedAt,
+          UpdatedAt,
+          MongoId
+        ) VALUES (
+          ${mssqlRFQId},
+          ${quote.vendorName},
+          ${quote.price},
+          ${truncatedMessage},
+          ${quote.numberOfTrucks},
+          ${quote.validityPeriod || null},
+          ${quote.label || null},
+          ${quote.trucksAllotted || 0},
+          ${quote.numberOfVehiclesPerDay},
+          ${quote.createdAt || new Date()},
+          ${quote.updatedAt || new Date()},
+          ${quote._id.toString()}
+        )
+      `;
+      console.log(`Inserted Quote ID: ${quote._id}`);
+      migratedCount++;
+    } catch (error) {
+      console.error(`Error migrating Quote ID ${quote._id}:`, error);
+      skippedCount++;
+    }
   }
+
+  console.log(`Quote Migration Completed: ${migratedCount} migrated, ${skippedCount} skipped.`);
 }
 
 // Helper function to get MSSQL RFQ ID based on MongoId
